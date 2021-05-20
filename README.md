@@ -1,5 +1,7 @@
 # BLS
-BLS signature scheme for substrate
 
+This repo is forked from the rust-impl found in this repo https://github.com/algorand/bls_sigs_ref
 
-https://datatracker.ietf.org/doc/html/draft-boneh-bls-signature-00#section-1.2
+NOTE THIS CODE IS NOT AUDITED AND IS NOT GUARANTEED TO BE CONTANT TIME
+
+This code has been extended by Ben Marsh and Cristian Lupascu.
