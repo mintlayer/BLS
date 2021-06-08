@@ -6,5 +6,5 @@ NOTE THIS CODE IS NOT AUDITED AND IS NOT GUARANTEED TO BE CONTANT TIME DO NOT US
 
 This code has been extended by Ben Marsh and Cristian Lupascu.
 
-Copies of the RFCs can be found in docs/
+Copies of the RFCs can be found in docs/fdfd
 
