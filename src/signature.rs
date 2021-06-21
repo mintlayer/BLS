@@ -15,6 +15,7 @@ use sha2::Sha256;
 use std::collections::HashSet;
 use std::io::Cursor;
 use std::vec::Vec;
+use ring::rand::SecureRandom;
 
 /// Hash a secret key sk to the secret exponent x'; then (PK, SK) = (g^{x'}, x').
 // NOTE: this implementation leaves the key_info parameter as the default empty string
@@ -26,6 +27,7 @@ pub fn xprime_from_sk<B: AsRef<[u8]>>(msg: B) -> Fr {
     msg_prime.extend_from_slice(&[0]);
     // `result` has enough length to hold the output from HKDF expansion
     let mut result = GenericArray::<u8, U48>::default();
+    //CONST TIME
     assert!(Hkdf::<Sha256>::new(Some(SALT), &msg_prime[..])
         .expand(&[0, 48], &mut result)
         .is_ok());
@@ -423,4 +425,12 @@ impl BLSSignaturePop<ExpandMsgXmd<Sha256>> for G2 {
     const CSUITE: &'static [u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
     const CSUITE_POP: &'static [u8] = b"BLS_POP_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
     type Length = U48;
+}
+
+/// returns 32 cryptographically secure bytes for key gen
+pub fn get_rnd_vec() -> Vec<u8> {
+    let mut rbytes = vec![0u8; 32];
+    let rnd = ring::rand::SystemRandom::new();
+    rnd.fill(&mut rbytes).unwrap();
+    rbytes
 }
