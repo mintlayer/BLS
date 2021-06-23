@@ -21,10 +21,11 @@ extern crate pairing_plus;
 #[cfg(test)]
 extern crate rand;
 extern crate sha2;
+extern crate ring;
 
 mod signature;
 
-pub use signature::{BLSSigCore, BLSSignatureAug, BLSSignatureBasic, BLSSignaturePop};
+pub use signature::{BLSSigCore, BLSSignatureAug, BLSSignatureBasic, BLSSignaturePop, get_rnd_vec};
 
 #[cfg(test)]
 mod test;

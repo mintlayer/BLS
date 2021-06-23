@@ -17,6 +17,7 @@ hkdf = "0.8.0"
 #pairing-plus = { path = "../../pairing-plus" }
 pairing-plus = "0.19"
 sha2 = "0.8.0"
+ring = "0.16.20"
 
 [dev-dependencies]
 byteorder = "1"
