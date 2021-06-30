@@ -1,6 +1,6 @@
 # BLS
 
-A simple no_std BLS signature implementatino
+A simple no_std BLS signature implementation
 
 https://en.wikipedia.org/wiki/BLS_digital_signature
 https://github.com/algorand/bls_sigs_ref
