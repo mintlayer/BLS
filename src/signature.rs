@@ -1,426 +1,356 @@
-/*!
-BLS signatures
-*/
+//MINTLAYER 2021
+//BMARSH - ben at mintlayer dot org
 
+
+/**
+ * 
+ * WARNING THIS CODE IS WIP AND HAS NOT BEEN AUDITED
+ * 
+ * 
+ * no_std implementation of BLS sigs, sig aggregation and proof of ownership
+ * 
+ * Designed to be used with Mintlayer's substrate based core node but should be portable
+ * 
+ * The code is not constant time
+ * 
+ * BLS12-381
+ * embedding degree 12 - 381 bit prime field
+ * z = -0xd201000000010000
+ * p = (z-1)^2(z^4-z^2+1)/3+z = 0x1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaab
+ * q = z^4 - z^2 + 1 = 0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001
+ * 
+ * https://github.com/nccgroup/pairing-bls12381
+ * 
+ * 
+ **/
+use bls12_381_plus::{multi_miller_loop, ExpandMsgXmd, G1Affine, G1Projective, G2Affine, G2Prepared, G2Projective, Scalar, pairing, Gt};
+use core::ops::{BitOr, Neg, Not};
 use ff::Field;
-use hkdf::Hkdf;
-use pairing_plus::bls12_381::{Bls12, Fq12, Fr, G1, G2};
-use pairing_plus::hash_to_curve::HashToCurve;
-use pairing_plus::hash_to_field::{BaseFromRO, ExpandMsg, ExpandMsgXmd};
-use pairing_plus::serdes::SerDes;
-use pairing_plus::{CurveAffine, CurveProjective, Engine};
-use sha2::digest::generic_array::typenum::{U48, U96};
-use sha2::digest::generic_array::{ArrayLength, GenericArray};
-use sha2::Sha256;
-use std::collections::HashSet;
-use std::io::Cursor;
-use std::vec::Vec;
+use group::{Curve, Group};
+use subtle::{Choice, CtOption};
+use hkdf::HkdfExtract;
+use zeroize::Zeroize;
 
-/// Hash a secret key sk to the secret exponent x'; then (PK, SK) = (g^{x'}, x').
-// NOTE: this implementation leaves the key_info parameter as the default empty string
-pub fn xprime_from_sk<B: AsRef<[u8]>>(msg: B) -> Fr {
-    const SALT: &[u8] = b"BLS-SIG-KEYGEN-SALT-";
-    // copy of `msg` with appended zero byte
-    let mut msg_prime = Vec::<u8>::with_capacity(msg.as_ref().len() + 1);
-    msg_prime.extend_from_slice(msg.as_ref());
-    msg_prime.extend_from_slice(&[0]);
-    // `result` has enough length to hold the output from HKDF expansion
-    let mut result = GenericArray::<u8, U48>::default();
-    assert!(Hkdf::<Sha256>::new(Some(SALT), &msg_prime[..])
-        .expand(&[0, 48], &mut result)
-        .is_ok());
-    Fr::from_okm(&result)
-}
+//todo clean this up
+pub const SK_SIZE: usize = 32;//sk is 32 bytes
+pub const SIG_BYTES: usize = 48;//sig is 48 bytes
+pub const PK_BYTES: usize = 96;//pk is 96 bytes - there's a pattern here isn't there :)
+pub const SALT: &[u8] = b"BLS-SIG-KEYGEN-SALT-";
+pub const CSUITE: &'static [u8] = b"BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_POP_";
+pub const CSUITE_POP: &'static [u8] = b"BLS_POP_BLS12381G1_XMD:SHA-256_SSWU_RO_POP_";
 
-// multi-point-addition helper: used in aggregate and in PoP verify
-fn _agg_help<T: CurveProjective>(ins: &[T]) -> T {
-    let mut ret = T::zero();
-    for inv in ins {
-        ret.add_assign(inv);
-    }
-    ret
-}
 
-/// Alias for the scalar type corresponding to a CurveProjective type
-type ScalarT<PtT> = <PtT as CurveProjective>::Scalar;
+#[derive(Clone, Debug, Eq, PartialEq, Zeroize, Default)]//no copy
+#[zeroize(drop)]//zeroize on drop automatically
+pub struct Sk(pub Scalar);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Sig(pub(crate) G1Projective);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Pk(pub G2Projective);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct MSig(pub(crate) G1Projective);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct MPk(pub(crate) G2Projective);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct SigAgr(pub(crate) G1Projective);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct ProfOfPos(pub(crate) G1Projective);//prove ownership
 
-/// BLS signature implementation
-pub trait BLSSigCore<X: ExpandMsg>: CurveProjective {
-    /// The type of the public key
-    type PKType: CurveProjective<Engine = <Self as CurveProjective>::Engine, Scalar = ScalarT<Self>>
-        + SerDes;
+//TODO get 32 rand bytes sk gen
+//TODO defaults??
 
-    /// Generate secret exponent and public key
-    /// * input: the secret key as bytes
-    /// * output: the actual secret key x_prime, a.k.a, the secret scala
-    /// * output: the public key g^x_prime
-    fn keygen<B: AsRef<[u8]>>(sk: B) -> (ScalarT<Self>, Self::PKType);
-
-    /// Sign a message
-    /// * input: the actual secret key x_prime
-    /// * input: the message as bytes
-    /// * input: the ciphersuite ID
-    /// * output: a signature
-    fn core_sign<B: AsRef<[u8]>, C: AsRef<[u8]>>(
-        x_prime: ScalarT<Self>,
-        msg: B,
-        ciphersuite: C,
-    ) -> Self;
-
-    /// Verify a signature
-    /// * input: public key, a group element
-    /// * input: signature, a group element
-    /// * input: the message as bytes
-    /// * input: ciphersuite ID
-    /// * output: if the signature is valid or not
-    fn core_verify<B: AsRef<[u8]>, C: AsRef<[u8]>>(
-        pk: Self::PKType,
-        sig: Self,
-        msg: B,
-        ciphersuite: C,
-    ) -> bool;
-
-    /// Aggregate signatures
-    fn aggregate(sigs: &[Self]) -> Self {
-        _agg_help(sigs)
+//secret key impl
+//NOTE should NOT be shared or stored unsafely
+//usage of sk should be checked by bm
+impl Sk {
+    // Get sk from random data
+    pub fn from_rnd<B: AsRef<[u8]>>(rnd: B) -> Option<Self> {
+        Self::gen_key(rnd.as_ref())
     }
 
-    /// Verify an aggregated signature
-    fn core_aggregate_verify<B: AsRef<[u8]>, C: AsRef<[u8]>>(
-        pks: &[Self::PKType],
-        msgs: &[B],
-        sig: Self,
-        ciphersuite: C,
-    ) -> bool;
-}
-
-/// 'Basic' BLS signature
-pub trait BLSSignatureBasic<X: ExpandMsg>: BLSSigCore<X> {
-    /// Ciphersuite tag
-    const CSUITE: &'static [u8];
-
-    /// re-export from BLSSigCore
-    fn sign<B: AsRef<[u8]>>(x_prime: ScalarT<Self>, msg: B) -> Self {
-        <Self as BLSSigCore<X>>::core_sign(x_prime, msg, Self::CSUITE)
+    // turn sk to big end byte arr
+    pub fn to_bytes(&self) -> [u8; SK_SIZE] {
+        let mut bytes = self.0.to_bytes();
+        bytes.reverse();//reverse byte order
+        bytes
     }
 
-    /// re-export from BLSSigCore
-    fn verify<B: AsRef<[u8]>>(pk: Self::PKType, sig: Self, msg: B) -> bool {
-        <Self as BLSSigCore<X>>::core_verify(pk, sig, msg, Self::CSUITE)
+    // turn big end byte arr to sk
+    pub fn from_bytes(bytes: &[u8; SK_SIZE]) -> CtOption<Self> {
+        let mut t = [0u8; SK_SIZE];
+        t.clone_from_slice(bytes);
+        t.reverse();
+        Scalar::from_bytes(&t).map(Sk)
     }
 
-    /// check for uniqueness of msgs, then invoke verify from BLSSigCore
-    fn aggregate_verify<B: AsRef<[u8]>>(pks: &[Self::PKType], msgs: &[B], sig: Self) -> bool {
-        // enforce uniqueness of messages
-        let mut msg_set = HashSet::<&[u8]>::with_capacity(msgs.len());
-        for msg in msgs {
-            msg_set.insert(msg.as_ref());
+    //get sk from 32 random bytes as per draft rfc
+    //ikm passed to gen_key must be random
+    //skr is random int 1 <= sk < r
+    //TODO make fully compliant
+    pub fn gen_key(ikm: &[u8]) -> Option<Sk> {
+
+        //todo check ikm is >= 32 bytes
+
+        const INFO: [u8; 2] = [0u8, 48u8];//empty string
+
+        //use hkdf rfc5869 for key expansion
+        let mut hkdfkg = HkdfExtract::<sha2::Sha256>::new(Some(SALT));
+        //feed ikm to hkdf-extract
+        hkdfkg.input_ikm(ikm);
+        //TODO IKM || I2OSP(0, 1))
+        //retunrs rnd key + kkdf
+        let (_, hkdfout) = hkdfkg.finalize();
+
+        let mut okm = [0u8; 48];
+        if hkdfout.expand(&INFO, &mut okm).is_err() {
+            None
+        } else {
+            Some(Sk(Scalar::from_okm(&okm)))
         }
-        if msg_set.len() != msgs.len() {
-            return false;
-        }
+    }  
+}
 
-        <Self as BLSSigCore<X>>::core_aggregate_verify(pks, msgs, sig, Self::CSUITE)
+//impl of the actual signature
+impl Sig {
+    //BLS sig
+    pub fn new<B: AsRef<[u8]>>(sk: &Sk, msg: B) -> Option<Self> {
+        if sk.0.is_zero() {
+            return None;
+        }
+        let a = Self::hash_msg(msg.as_ref());
+        Some(Self(a * sk.0))
+    }
+
+    pub(crate) fn hash_msg(msg: &[u8]) -> G1Projective {
+        // elem of g1 in proj coord space
+        G1Projective::hash::<ExpandMsgXmd<sha2::Sha256>>(msg, CSUITE)
+    }
+
+    //is the sig valid?
+    pub fn is_valid(&self) -> Choice {
+        self.0.is_identity().not().bitor(self.0.is_on_curve())
+    }
+
+    // verify sig via pk
+    pub fn verify<B: AsRef<[u8]>>(&self, pk: Pk, msg: B) -> Choice {
+        if pk.0.is_identity().bitor(self.is_valid()).unwrap_u8() == 0 {//sig is invalid
+            return Choice::from(0);
+        }
+        let a = Self::hash_msg(msg.as_ref());
+        //g2 elm in affine coord space - in q order subgrp
+        let g2 = G2Affine::generator().neg();
+
+        //series (a1,b1)...(an,bn)
+        multi_miller_loop(&[
+            (&a.to_affine(), &G2Prepared::from(pk.0.to_affine())),
+            (&self.0.to_affine(), &G2Prepared::from(g2)),
+        ])
+        .final_exponentiation()
+        .is_identity()
+    }
+
+    // to bytes from sig
+    pub fn to_bytes(&self) -> [u8; SIG_BYTES] {
+        self.0.to_affine().to_compressed()
+    }
+
+    // to sig from bytes
+    pub fn from_bytes(bytes: &[u8; SIG_BYTES]) -> CtOption<Self> {
+        //affine repr of elem in g1
+        G1Affine::from_compressed(&bytes).map(|p| Self(G1Projective::from(&p)))
     }
 }
 
-/// BLS signature with message augmentation
-pub trait BLSSignatureAug<X: ExpandMsg>: BLSSigCore<X> {
-    /// Ciphersuite tag
-    const CSUITE: &'static [u8];
-
-    /// Length of pubkey in bytes
-    const PK_LEN: usize;
-
-    /// turn a public key into a vector
-    fn pk_bytes(pk: &Self::PKType, size_hint: usize) -> Vec<u8> {
-        // 96 bytes of overhead for the PK, plus the size hint
-        let mut cur = Cursor::new(Vec::<u8>::with_capacity(size_hint + Self::PK_LEN));
-        assert!(pk.serialize(&mut cur, true).is_ok());
-        cur.into_inner()
+//public key - created from a sk
+impl Pk {
+    //pk valid?
+    pub fn is_valid(&self) -> Choice {
+        self.0.is_identity().not().bitor(self.0.is_on_curve())
     }
 
-    /// augment message and then invoke coresign
-    fn sign<B: AsRef<[u8]>>(x_prime: ScalarT<Self>, msg: B) -> Self {
-        let pk = {
-            let mut tmp = <Self::PKType as CurveProjective>::one();
-            tmp.mul_assign(x_prime);
-            tmp
-        };
-        let mut pk_msg_vec = Self::pk_bytes(&pk, msg.as_ref().len());
-        pk_msg_vec.extend_from_slice(msg.as_ref());
-        <Self as BLSSigCore<X>>::core_sign(x_prime, &pk_msg_vec, Self::CSUITE)
+    //pk to bytes
+    pub fn to_bytes(&self) -> [u8; PK_BYTES] {
+        self.0.to_affine().to_compressed()
     }
 
-    /// augment message and then invoke coreverify
-    fn verify<B: AsRef<[u8]>>(pk: Self::PKType, sig: Self, msg: B) -> bool {
-        let mut pk_msg_vec = Self::pk_bytes(&pk, msg.as_ref().len());
-        pk_msg_vec.extend_from_slice(msg.as_ref());
-        <Self as BLSSigCore<X>>::core_verify(pk, sig, &pk_msg_vec, Self::CSUITE)
-    }
-
-    /// augment all messages and then invoke coreverify
-    fn aggregate_verify<B: AsRef<[u8]>>(pks: &[Self::PKType], msgs: &[B], sig: Self) -> bool {
-        let mut pks_msgs_vec = Vec::<Vec<u8>>::with_capacity(msgs.len());
-        for (msg, pk) in msgs.iter().zip(pks) {
-            let mut pk_msg_vec = Self::pk_bytes(&pk, msg.as_ref().len());
-            pk_msg_vec.extend_from_slice(msg.as_ref());
-            pks_msgs_vec.push(pk_msg_vec);
-        }
-        <Self as BLSSigCore<X>>::core_aggregate_verify(pks, &pks_msgs_vec[..], sig, Self::CSUITE)
+    // pk from bytes
+    pub fn from_bytes(bytes: &[u8; PK_BYTES]) -> CtOption<Self> {
+        //attempt to deserialize from compressed bytes from g2 elem
+        G2Affine::from_compressed(bytes).map(|p| Self(G2Projective::from(&p)))
     }
 }
 
-/// BLS signature with proof of possession
-pub trait BLSSignaturePop<X: ExpandMsg>: BLSSigCore<X> {
-    /// Ciphersuite tag
-    const CSUITE: &'static [u8];
-
-    /// PoP ciphersuite tag
-    const CSUITE_POP: &'static [u8];
-
-    /// Length of serialized pubkey, for computing PoP
-    type Length: ArrayLength<u8>;
-
-    /// re-export from BLSSigCore
-    fn sign<B: AsRef<[u8]>>(x_prime: ScalarT<Self>, msg: B) -> Self {
-        <Self as BLSSigCore<X>>::core_sign(x_prime, msg, Self::CSUITE)
+//proof of ownership of sk
+impl ProfOfPos {
+    pub fn new(sk: &Sk) -> Option<Self> {
+        if sk.0.is_zero() {
+            return None;
+        }
+        let pk = Pk::from(sk);
+        //g1proj in proj coord space
+        let a = G1Projective::hash::<ExpandMsgXmd<sha2::Sha256>>(&pk.to_bytes(), CSUITE_POP);
+        Some(Self(a * sk.0))
     }
 
-    /// re-export from BLSSigCore
-    fn verify<B: AsRef<[u8]>>(pk: Self::PKType, sig: Self, msg: B) -> bool {
-        <Self as BLSSigCore<X>>::core_verify(pk, sig, msg, Self::CSUITE)
+    //verify proof for pk
+    pub fn verify(&self, pk: Pk) -> Choice {
+        if pk.0.is_identity().unwrap_u8() == 1 {
+            return Choice::from(0);
+        }
+        //gqproj from elpitical curve hash
+        let a = G1Projective::hash::<ExpandMsgXmd<sha2::Sha256>>(&pk.to_bytes(), CSUITE_POP);
+        //fixed generator for group
+        //group chosen accorsding to https://docs.rs/bls12_381/0.1.1/bls12_381/notes/design/index.html#fixed-generators
+        let g2 = G2Affine::generator().neg();
+
+        //series (a1,b1)...(an,bn)
+        multi_miller_loop(&[
+            (&a.to_affine(), &G2Prepared::from(pk.0.to_affine())),
+            (&self.0.to_affine(), &G2Prepared::from(g2)),
+        ])
+        .final_exponentiation()
+        .is_identity()//final_expon converts result to Gt elem using cyclotomic subgroup Fq6
     }
 
-    /// just invoke verify from BLSSigCore
-    fn aggregate_verify<B: AsRef<[u8]>>(pks: &[Self::PKType], msgs: &[B], sig: Self) -> bool {
-        <Self as BLSSigCore<X>>::core_aggregate_verify(pks, msgs, sig, Self::CSUITE)
+    // proof as bytes
+    pub fn to_bytes(&self) -> [u8; SIG_BYTES] {
+        self.0.to_affine().to_compressed()
     }
 
-    /// verify a multisig
-    fn multisig_verify<B: AsRef<[u8]>>(pks: &[Self::PKType], sig: Self, msg: B) -> bool {
-        let apk = _agg_help(pks);
-        <Self as BLSSigCore<X>>::core_verify(apk, sig, msg, Self::CSUITE)
-    }
-
-    /// prove possession
-    fn pop_prove<B: AsRef<[u8]>>(sk: B) -> Self {
-        let (x_prime, pk) = <Self as BLSSigCore<X>>::keygen(sk);
-        let pk_bytes = {
-            let mut buf = GenericArray::<u8, Self::Length>::default();
-            let mut cur = Cursor::new(&mut buf[..]);
-            assert!(pk.serialize(&mut cur, true).is_ok());
-            buf
-        };
-        <Self as BLSSigCore<X>>::core_sign(x_prime, &pk_bytes[..], Self::CSUITE_POP)
-    }
-
-    /// check proof of possession
-    fn pop_verify(pk: <Self as BLSSigCore<X>>::PKType, sig: Self) -> bool {
-        let pk_bytes = {
-            let mut buf = GenericArray::<u8, Self::Length>::default();
-            let mut cur = Cursor::new(&mut buf[..]);
-            assert!(pk.serialize(&mut cur, true).is_ok());
-            buf
-        };
-        <Self as BLSSigCore<X>>::core_verify(pk, sig, &pk_bytes[..], Self::CSUITE_POP)
+    // proof from bytes
+    pub fn from_bytes(bytes: &[u8; SIG_BYTES]) -> CtOption<Self> {
+        let mut t = [0u8; SIG_BYTES];
+        t.clone_from_slice(bytes);
+        G1Affine::from_compressed(&t).map(|p| Self(G1Projective::from(&p)))
     }
 }
 
-impl<X: ExpandMsg> BLSSigCore<X> for G1 {
-    type PKType = G2;
-
-    fn keygen<B: AsRef<[u8]>>(sk: B) -> (Fr, G2) {
-        let x_prime = xprime_from_sk(sk);
-        let mut pk = G2::one();
-        pk.mul_assign(x_prime);
-        (x_prime, pk)
+//multisig
+impl MSig {
+    pub fn is_valid(&self) -> Choice {
+        self.0.is_identity().not().bitor(self.0.is_on_curve())
     }
 
-    fn core_sign<B: AsRef<[u8]>, C: AsRef<[u8]>>(x_prime: Fr, msg: B, ciphersuite: C) -> G1 {
-        let mut p = <G1 as HashToCurve<X>>::hash_to_curve(msg, ciphersuite);
-        p.mul_assign(x_prime);
-        p
+    pub fn verify<B: AsRef<[u8]>>(&self, public_key: MPk, msg: B) -> Choice {
+        Sig(self.0).verify(Pk(public_key.0), msg)
     }
 
-    fn core_verify<B: AsRef<[u8]>, C: AsRef<[u8]>>(
-        pk: G2,
-        sig: G1,
-        msg: B,
-        ciphersuite: C,
-    ) -> bool {
-        let p = <G1 as HashToCurve<X>>::hash_to_curve(msg, ciphersuite)
-            .into_affine()
-            .prepare();
-        let g2gen = {
-            let mut tmp = G2::one();
-            tmp.negate();
-            tmp.into_affine().prepare()
-        };
+    pub fn to_bytes(&self) -> [u8; SIG_BYTES] {
+        self.0.to_affine().to_compressed()
+    }
 
-        match Bls12::final_exponentiation(&Bls12::miller_loop(&[
-            (&p, &pk.into_affine().prepare()),
-            (&sig.into_affine().prepare(), &g2gen),
-        ])) {
-            None => false,
-            Some(pairingproduct) => pairingproduct == Fq12::one(),
+    pub fn from_bytes(bytes: &[u8; SIG_BYTES]) -> CtOption<Self> {
+        let mut t = [0u8; SIG_BYTES];
+        t.clone_from_slice(bytes);
+        G1Affine::from_compressed(&t).map(|p| Self(G1Projective::from(&p)))
+    }
+}
+
+//multi public key
+impl MPk {
+    pub fn is_valid(&self) -> Choice {
+        self.0.is_identity().not().bitor(self.0.is_on_curve())
+    }
+
+    pub fn to_bytes(&self) -> [u8; PK_BYTES] {
+        self.0.to_affine().to_compressed()
+    }
+
+    pub fn from_bytes(bytes: &[u8; PK_BYTES]) -> CtOption<Self> {
+        let mut t = [0u8; PK_BYTES];
+        t.clone_from_slice(bytes);
+        G2Affine::from_compressed(&t).map(|p| Self(G2Projective::from(&p)))
+    }
+}
+
+//signature aggr
+impl SigAgr {
+    //check if it's a valid pk
+    pub fn is_valid(&self) -> Choice {
+        self.0.is_identity().not().bitor(self.0.is_on_curve())
+    }
+
+    pub fn verify<B: AsRef<[u8]>>(&self, pk_msg_pair: &[(Pk, B)]) -> Choice {
+        if self.is_valid().unwrap_u8() == 0 {
+            return Choice::from(0u8);
         }
-    }
 
-    fn core_aggregate_verify<B: AsRef<[u8]>, C: AsRef<[u8]>>(
-        pks: &[G2],
-        msgs: &[B],
-        sig: G1,
-        ciphersuite: C,
-    ) -> bool {
-        let pvec = {
-            let mut ret =
-                Vec::<<<G1 as CurveProjective>::Affine as CurveAffine>::Prepared>::with_capacity(
-                    msgs.len() + 1,
-                );
-            for msg in msgs {
-                ret.push(
-                    <G1 as HashToCurve<X>>::hash_to_curve(msg, &ciphersuite)
-                        .into_affine()
-                        .prepare(),
-                );
+        fn verify_aggr_sig<B: AsRef<[u8]>>(
+            sig: &G1Projective,
+            pk_msg_pair: &[(Pk, B)],
+        ) -> Choice {
+            //Gt arithmetic group??
+            //FIXME??
+            let mut res = Gt::identity();
+            //loop through pk,msg pairs and check 'em
+            for (key, msg) in pk_msg_pair {
+                //key isn't valid so we quit
+                if key.is_valid().unwrap_u8() == 0 {
+                    return Choice::from(0u8);
+                }
+                let a = Sig::hash_msg(msg.as_ref());
+                res += pairing(&a.to_affine(), &key.0.to_affine());
             }
-            ret.push(sig.into_affine().prepare());
-            ret
-        };
-        let qvec = {
-            let mut ret =
-                Vec::<<<G2 as CurveProjective>::Affine as CurveAffine>::Prepared>::with_capacity(
-                    pks.len() + 1,
-                );
-            for pk in pks {
-                ret.push(pk.into_affine().prepare());
-            }
-            let mut tmp = G2::one();
-            tmp.negate();
-            ret.push(tmp.into_affine().prepare());
-            ret
-        };
-
-        // XXX: this is annoying: miller_loop requires an iter to tuple refs, not tuples
-        let pqz: Vec<_> = pvec.as_slice().iter().zip(qvec.as_slice()).collect();
-        match Bls12::final_exponentiation(&Bls12::miller_loop(&pqz[..])) {
-            None => false,
-            Some(pairingproduct) => pairingproduct == Fq12::one(),
+            res += pairing(&sig.to_affine(), &G2Affine::generator().neg());
+            res.is_identity()
         }
+        verify_aggr_sig(&self.0, pk_msg_pair)
+    }
+
+    //make me bytes
+    pub fn to_bytes(&self) -> [u8; SIG_BYTES] {
+        self.0.to_affine().to_compressed()
+    }
+    //get me from bytes
+    pub fn from_bytes(bytes: &[u8; SIG_BYTES]) -> CtOption<Self> {
+        let mut t = [0u8; SIG_BYTES];
+        t.clone_from_slice(bytes);
+        G1Affine::from_compressed(&t).map(|p| Self(G1Projective::from(&p)))
     }
 }
 
-impl BLSSignatureBasic<ExpandMsgXmd<Sha256>> for G1 {
-    const CSUITE: &'static [u8] = b"BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_NUL_";
-}
-
-impl BLSSignatureAug<ExpandMsgXmd<Sha256>> for G1 {
-    const CSUITE: &'static [u8] = b"BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_AUG_";
-    const PK_LEN: usize = 96;
-}
-
-impl BLSSignaturePop<ExpandMsgXmd<Sha256>> for G1 {
-    const CSUITE: &'static [u8] = b"BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_POP_";
-    const CSUITE_POP: &'static [u8] = b"BLS_POP_BLS12381G1_XMD:SHA-256_SSWU_RO_POP_";
-    type Length = U96;
-}
-
-impl<X: ExpandMsg> BLSSigCore<X> for G2 {
-    type PKType = G1;
-
-    fn keygen<B: AsRef<[u8]>>(sk: B) -> (Fr, G1) {
-        let x_prime = xprime_from_sk(sk);
-        let mut pk = G1::one();
-        pk.mul_assign(x_prime);
-        (x_prime, pk)
+//convert sk to bytes
+impl From<Sk> for [u8; SK_SIZE] {
+    fn from(sk: Sk) -> [u8; SK_SIZE] {
+        sk.to_bytes()
     }
+}
 
-    fn core_sign<B: AsRef<[u8]>, C: AsRef<[u8]>>(x_prime: Fr, msg: B, ciphersuite: C) -> G2 {
-        let mut p = <G2 as HashToCurve<X>>::hash_to_curve(msg, ciphersuite);
-        p.mul_assign(x_prime);
-        p
+//get pk from sk
+impl From<&Sk> for Pk {
+    fn from(s: &Sk) -> Self {
+        Self(G2Projective::generator() * s.0)
     }
+}
 
-    fn core_verify<B: AsRef<[u8]>, C: AsRef<[u8]>>(
-        pk: G1,
-        sig: G2,
-        msg: B,
-        ciphersuite: C,
-    ) -> bool {
-        let p = <G2 as HashToCurve<X>>::hash_to_curve(msg, ciphersuite)
-            .into_affine()
-            .prepare();
-        let g1gen = {
-            let mut tmp = G1::one();
-            tmp.negate();
-            tmp.into_affine().prepare()
-        };
-
-        match Bls12::final_exponentiation(&Bls12::miller_loop(&[
-            (&pk.into_affine().prepare(), &p),
-            (&g1gen, &sig.into_affine().prepare()),
-        ])) {
-            None => false,
-            Some(pairingproduct) => pairingproduct == Fq12::one(),
+//get multisig from sigs
+impl From<&[Sig]> for MSig {
+    fn from(sigs: &[Sig]) -> Self {
+        let mut g = G1Projective::identity();
+        for s in sigs {
+            g += s.0;
         }
+        Self(g)
     }
+}
 
-    fn core_aggregate_verify<B: AsRef<[u8]>, C: AsRef<[u8]>>(
-        pks: &[G1],
-        msgs: &[B],
-        sig: G2,
-        ciphersuite: C,
-    ) -> bool {
-        let pvec = {
-            let mut ret =
-                Vec::<<<G1 as CurveProjective>::Affine as CurveAffine>::Prepared>::with_capacity(
-                    pks.len() + 1,
-                );
-            for pk in pks {
-                ret.push(pk.into_affine().prepare());
-            }
-            let mut tmp = G1::one();
-            tmp.negate();
-            ret.push(tmp.into_affine().prepare());
-            ret
-        };
-        let qvec = {
-            let mut ret =
-                Vec::<<<G2 as CurveProjective>::Affine as CurveAffine>::Prepared>::with_capacity(
-                    msgs.len() + 1,
-                );
-            for msg in msgs {
-                ret.push(
-                    <G2 as HashToCurve<X>>::hash_to_curve(msg, &ciphersuite)
-                        .into_affine()
-                        .prepare(),
-                );
-            }
-            ret.push(sig.into_affine().prepare());
-            ret
-        };
-
-        // XXX: this is annoying: miller_loop requires an iter to tuple refs, not tuples
-        let pqz: Vec<_> = pvec.as_slice().iter().zip(qvec.as_slice()).collect();
-        match Bls12::final_exponentiation(&Bls12::miller_loop(&pqz[..])) {
-            None => false,
-            Some(pairingproduct) => pairingproduct == Fq12::one(),
+impl From<&[Pk]> for MPk {
+    fn from(keys: &[Pk]) -> Self {
+        let mut g = G2Projective::identity();
+        for k in keys {
+            g += k.0;
         }
+        Self(g)
     }
 }
 
-impl BLSSignatureBasic<ExpandMsgXmd<Sha256>> for G2 {
-    const CSUITE: &'static [u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_";
-}
-
-impl BLSSignatureAug<ExpandMsgXmd<Sha256>> for G2 {
-    const CSUITE: &'static [u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_AUG_";
-    const PK_LEN: usize = 48;
-}
-
-impl BLSSignaturePop<ExpandMsgXmd<Sha256>> for G2 {
-    const CSUITE: &'static [u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
-    const CSUITE_POP: &'static [u8] = b"BLS_POP_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
-    type Length = U48;
+//get aggregated sig from sigs
+impl From<&[Sig]> for SigAgr {
+    fn from(sigs: &[Sig]) -> Self {
+        let mut g = G1Projective::identity();
+        for s in sigs {
+            g += s.0;
+        }
+        Self(g)
+    }
 }
