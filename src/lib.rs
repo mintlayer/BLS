@@ -23,3 +23,5 @@ extern crate zeroize;
 
 mod signature;
 pub use signature::*;
+
+//TODO add some automated tests back in. The old tests still pass I just need to add them back :)
