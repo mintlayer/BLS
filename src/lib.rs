@@ -1,31 +1,27 @@
-#![cfg_attr(feature = "cargo-clippy", deny(warnings))]
-#![cfg_attr(feature = "cargo-clippy", allow(clippy::unreadable_literal))]
 #![deny(missing_debug_implementations)]
-#![deny(missing_docs)]
+#![deny(unsafe_code)]
+#![no_std]
 
-/*!
- This crate implements BLS signatures as specified in the
- [current draft specification](https://github.com/pairingwg/bls_standard/blob/master/minutes/spec-v1.md).
+#[cfg(feature = "alloc")]
+extern crate alloc;
 
- It is based upon the pairing crate's implementation of BLS12-381.
-*/
-
-#[cfg(test)]
-extern crate byteorder;
-extern crate ff_zeroize as ff;
-
-#[cfg(test)]
-extern crate hex_literal;
+/**
+ * BLS implementation
+ * 
+ * WARNING THIS CODE HAS NOT BEEN AUDITED
+ * 
+ **/
+extern crate bls12_381_plus;
+extern crate ff;
+extern crate group;
 extern crate hkdf;
-extern crate pairing_plus;
-#[cfg(test)]
-extern crate rand;
+extern crate pairing;
+extern crate serde;
 extern crate sha2;
-extern crate ring;
+extern crate subtle;
+extern crate zeroize;
 
 mod signature;
+pub use signature::*;
+//TODO add some automated tests back in. The old tests still pass I just need to add them back :)
 
-pub use signature::{BLSSigCore, BLSSignatureAug, BLSSignatureBasic, BLSSignaturePop, get_rnd_vec};
-
-#[cfg(test)]
-mod test;
