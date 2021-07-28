@@ -1,7 +1,6 @@
 // Copyright (c) 2021 RBB S.r.l
 // opensource@mintlayer.org
-//
-// Author: B. Marsh
+// Author(s): B. Marsh
 
 /**
  * 
