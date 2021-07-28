@@ -1,6 +1,7 @@
-//MINTLAYER 2021
-//BMARSH - ben at mintlayer dot org
-
+// Copyright (c) 2021 RBB S.r.l
+// opensource@mintlayer.org
+//
+// Author: B. Marsh
 
 /**
  * 
