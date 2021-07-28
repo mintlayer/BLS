@@ -1,6 +1,6 @@
 // Copyright (c) RBB S.r.l
 // opensource@mintlayer.org
-// Author: B. Marsh
+// Author(s): B. Marsh
 
 #![deny(missing_debug_implementations)]
 #![deny(unsafe_code)]
